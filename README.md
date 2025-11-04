@@ -76,7 +76,7 @@ cd ..
 ```
 
 ### 4. Kiểm tra cấu hình Android
-Đảm bảo file `android/local.properties` có đường dẫn SDK:
+Đảm bảo file `android/local.properties` có đường dẫn SDK. Nếu chưa có file `android/local.properties` thì có thể tạo thêm:
 ```properties
 sdk.dir=C\:\\Users\\YourUsername\\AppData\\Local\\Android\\sdk
 ```
