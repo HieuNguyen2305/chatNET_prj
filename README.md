@@ -1,3 +1,4 @@
+
 # ChatNET - Secure Communication Protocol
 > Ứng dụng nhắn tin bảo mật sử dụng mô hình Mã hóa lai (Hybrid Cryptosystem), Chữ ký số và Xác thực toàn vẹn dữ liệu.
 
@@ -76,3 +77,4 @@ Quy trình thiết lập kết nối an toàn diễn ra như sau:
     ```bash
     npm start
     ```
+
