@@ -1,788 +1,306 @@
 import React, { useState, useEffect, useRef } from 'react';
 import {
-  SafeAreaView,
-  ScrollView,
-  StyleSheet,
-  Text,
-  TextInput,
-  TouchableOpacity,
-  View,
-  KeyboardAvoidingView,
-  Platform,
-  Alert,
-  StatusBar,
-  Dimensions,
-  Modal,
-  Image,
-  ImageBackground,
+  SafeAreaView, ScrollView, StyleSheet, Text, TextInput, TouchableOpacity, View,
+  StatusBar, Alert, Modal, Dimensions
 } from 'react-native';
 import NetInfo from '@react-native-community/netinfo';
 import TcpSocket from 'react-native-tcp-socket';
-import { encryptCaesar, decryptCaesar, isValidKey, parseKey } from './src/utils/caesarCipher';
-
-const { width: SCREEN_WIDTH, height: SCREEN_HEIGHT } = Dimensions.get('window');
-
-const isSmallScreen = SCREEN_HEIGHT < 700;
-const isNarrowScreen = SCREEN_WIDTH < 360;
-const scale = (size: number) => (SCREEN_WIDTH / 375) * size;
-const verticalScale = (size: number) => (SCREEN_HEIGHT / 667) * size;
-const moderateScale = (size: number, factor = 0.5) => size + (scale(size) - size) * factor;
-
-const responsiveFontSize = (size: number) => {
-  const scaledSize = moderateScale(size, 0.3);
-  return Math.max(Math.min(scaledSize, size * 1.2), size * 0.85);
-};
-
-interface Message {
-  text: string;
-  sender: 'me' | 'other';
-  timestamp: Date;
-  encrypted?: boolean;
-}
+import CryptoJS from 'crypto-js';
+import { 
+  initSecurityContext, generateRandomSessionKey, encryptSessionKeyWithRSA,
+  decryptSessionKeyWithRSA, encryptPacket, decryptPacket, generateSafetyNumber, SecurityContext 
+} from './src/utils/SecureProtocol';
 
 const PORT = 8888;
 
+interface Message {
+  id: string; text: string; sender: 'me' | 'other' | 'system';
+  timestamp: Date; type: 'text' | 'voice' | 'image' | 'stego';
+  isVerified?: boolean; expiresAt?: number; signature?: string;
+}
+
 function App(): React.JSX.Element {
-  const [myIp, setMyIp] = useState<string>('Đang lấy IP...');
-  const [targetIp, setTargetIp] = useState<string>('');
-  const [message, setMessage] = useState<string>('');
+  const [securityCtx, setSecurityCtx] = useState<SecurityContext | null>(null);
+  const [partnerRSAPublicKey, setPartnerRSAPublicKey] = useState('');
+  const [safetyNumber, setSafetyNumber] = useState<string>('---');
+  const [isConnected, setIsConnected] = useState(false);
+  const [viewMode, setViewMode] = useState<'LOGIN' | 'CHAT' | 'TODO'>('LOGIN');
+  const [loginPass, setLoginPass] = useState('');
+  const [myIp, setMyIp] = useState('...');
+  const [targetIp, setTargetIp] = useState('');
   const [messages, setMessages] = useState<Message[]>([]);
-  const [isServerRunning, setIsServerRunning] = useState(false);
-  const [showHelp, setShowHelp] = useState(false);
-  const [encryptionKey, setEncryptionKey] = useState<string>('3');
-  const [showSettingsModal, setShowSettingsModal] = useState(false);
-  const [isEncryptionEnabled, setIsEncryptionEnabled] = useState(true);
-  
+  const [inputText, setInputText] = useState('');
+  const [selectedMsg, setSelectedMsg] = useState<Message | null>(null);
+
+  const socketRef = useRef<any>(null);
   const serverRef = useRef<any>(null);
-  const clientRef = useRef<any>(null);
-  const scrollViewRef = useRef<ScrollView>(null);
-  const encryptionKeyRef = useRef(encryptionKey);
-  const isEncryptionEnabledRef = useRef(isEncryptionEnabled);
-  
-  useEffect(() => {
-    encryptionKeyRef.current = encryptionKey;
-  }, [encryptionKey]);
+  const securityCtxRef = useRef<SecurityContext | null>(null);
+  const partnerRSARef = useRef('');
+
+  useEffect(() => { securityCtxRef.current = securityCtx; }, [securityCtx]);
+  useEffect(() => { partnerRSARef.current = partnerRSAPublicKey; }, [partnerRSAPublicKey]);
 
   useEffect(() => {
-    isEncryptionEnabledRef.current = isEncryptionEnabled;
-  }, [isEncryptionEnabled]);
+    NetInfo.fetch().then(s => setMyIp((s.details as any)?.ipAddress || 'Unknown'));
+    initSecurityContext().then(ctx => setSecurityCtx(ctx));
 
-  const fetchIpAddress = () => {
-    setMyIp('Đang lấy IP...');
-    NetInfo.fetch().then(state => {
-      if (state.details && 'ipAddress' in state.details) {
-        const ip = (state.details as any).ipAddress;
-        setMyIp(ip || 'Không tìm thấy IP');
-      } else {
-        setMyIp('Không tìm thấy IP');
-      }
+    const server = TcpSocket.createServer((socket) => {
+      socket.on('data', (d) => handleReceiveData(d, socket));
+      socket.on('error', (e) => console.log('Server Err:', e));
     });
-  };
-
-  useEffect(() => {
-    fetchIpAddress();
-  }, []);
-
-  useEffect(() => {
-    if (!isServerRunning) {
-      startServer();
-    }
-
+    server.listen({ port: PORT, host: '0.0.0.0' });
+    serverRef.current = server;
     return () => {
-      if (serverRef.current) {
-        serverRef.current.close();
-      }
-      if (clientRef.current) {
-        clientRef.current.destroy();
-      }
+      server.close();
+      if (socketRef.current) socketRef.current.destroy();
     };
   }, []);
 
-  const startServer = () => {
-    try {
-      const server = TcpSocket.createServer((socket: any) => {
-        socket.on('data', (data: any) => {
-          const receivedMessage = data.toString('utf8');
-          const isEncryptionOn = isEncryptionEnabledRef.current;
-          const currentKey = encryptionKeyRef.current;
-          let displayMessage = receivedMessage;
-          
-          if (isEncryptionOn && isValidKey(currentKey)) {
-            displayMessage = decryptCaesar(receivedMessage, parseKey(currentKey));
-          }
-          
-          setMessages(prev => [
-            ...prev,
-            {
-              text: displayMessage,
-              sender: 'other',
-              timestamp: new Date(),
-              encrypted: isEncryptionOn,
-            },
-          ]);
-        });
+  const handleReceiveData = (data: any, socket: any) => {
+    const rawString = data.toString('utf8');
 
-        socket.on('error', (error: any) => {
-        });
+    // 1. Nhận Public Key
+    if (rawString.startsWith('PUBKEY::')) {
+      const pubKey = rawString.replace('PUBKEY::', '');
+      setPartnerRSAPublicKey(pubKey);
+      if (securityCtxRef.current) {
+        setSafetyNumber(generateSafetyNumber(securityCtxRef.current.myRSAPublicKey, pubKey));
+      }
+      addSystemMsg('🔗 Đã nhận Public Key đối phương.');
+      return;
+    }
 
-        socket.on('close', () => {
-        });
-      });
+    // 2. Nhận Key AES
+    if (rawString.startsWith('SESSION::')) {
+      const encryptedKey = rawString.replace('SESSION::', '');
+      if (securityCtxRef.current) {
+        const key = decryptSessionKeyWithRSA(encryptedKey, securityCtxRef.current.myRSAPrivateKey);
+        if (key) {
+          setSecurityCtx(prev => prev ? ({ ...prev, sessionKey: key }) : null);
+          addSystemMsg('✅ RSA đã giải mã thành công Key AES! Bắt đầu Chat.');
+        } else {
+          addSystemMsg('❌ Lỗi giải mã Key AES.');
+        }
+      }
+      return;
+    }
 
-      server.listen({ port: PORT, host: '0.0.0.0' }, () => {
-        setIsServerRunning(true);
-      });
-
-      server.on('error', (error: any) => {
-        Alert.alert('Lỗi', 'Không thể khởi động server: ' + error.message);
-      });
-
-      serverRef.current = server;
-    } catch (error: any) {
-      Alert.alert('Lỗi', 'Không thể khởi động server: ' + error.message);
+    // 3. Nhận Tin nhắn
+    if (securityCtxRef.current?.sessionKey && partnerRSARef.current) {
+      const result = decryptPacket(rawString, securityCtxRef.current.sessionKey, partnerRSARef.current);
+      if (result.status === 'success') {
+        try {
+          const msgObj = JSON.parse(result.text);
+          const newMsg: Message = {
+            id: Date.now().toString() + Math.random(),
+            text: msgObj.content, type: msgObj.type || 'text', sender: 'other',
+            timestamp: new Date(), isVerified: true, signature: result.signature,
+            expiresAt: msgObj.ttl ? Date.now() + msgObj.ttl : undefined
+          };
+          setMessages(p => [...p, newMsg]);
+        } catch { /* Fallback */ }
+      } else {
+        addSystemMsg(`⚠️ CẢNH BÁO: Chữ ký số không khớp! Có thể bị MITM.`);
+      }
     }
   };
 
-  const sendMessage = () => {
-    if (!message.trim()) {
-      Alert.alert('Thông báo', 'Vui lòng nhập tin nhắn');
-      return;
-    }
+  const connectAndHandshake = () => {
+    if (!targetIp) return alert('Nhập IP!');
+    const client = TcpSocket.createConnection({ port: PORT, host: targetIp }, () => {
+      setIsConnected(true);
+      socketRef.current = client;
+      if (securityCtx) client.write('PUBKEY::' + securityCtx.myRSAPublicKey);
+    });
+    client.on('data', (d) => handleReceiveData(d, client));
+    client.on('error', (e) => addSystemMsg('Lỗi: ' + e.message));
+  };
 
-    if (!targetIp.trim()) {
-      Alert.alert('Thông báo', 'Vui lòng nhập IP đối phương trong Settings');
-      return;
-    }
-
-    if (isEncryptionEnabled && !isValidKey(encryptionKey)) {
-      Alert.alert('Lỗi mã hóa', 'Key phải là số từ 1-25');
-      return;
-    }
-
-    const messageToSend = message.trim();
-    const encryptedMessage = isEncryptionEnabled 
-      ? encryptCaesar(messageToSend, parseKey(encryptionKey))
-      : messageToSend;
+  const sendSecureKey = () => {
+    if (!partnerRSAPublicKey || !socketRef.current) return alert("Chưa có kết nối!");
+    const aesKey = generateRandomSessionKey();
+    setSecurityCtx(prev => prev ? ({ ...prev, sessionKey: aesKey }) : null);
     
-    setMessage('');
-
-    try {
-      let connectionTimeout: any;
-      let isConnected = false;
-
-      const client = TcpSocket.createConnection(
-        {
-          port: PORT,
-          host: targetIp,
-        },
-        () => {
-          isConnected = true;
-          clearTimeout(connectionTimeout);
-
-          client.write(encryptedMessage, 'utf8', (error) => {
-            if (error) {
-              Alert.alert('Lỗi', 'Không thể gửi tin nhắn: ' + error.message);
-            } else {
-              setMessages(prev => [
-                ...prev,
-                {
-                  text: messageToSend,
-                  sender: 'me',
-                  timestamp: new Date(),
-                  encrypted: isEncryptionEnabled,
-                },
-              ]);
-            }
-
-            setTimeout(() => {
-              client.destroy();
-            }, 100);
-          });
-        }
-      );
-
-      connectionTimeout = setTimeout(() => {
-        if (!isConnected) {
-          client.destroy();
-          Alert.alert(
-            'Lỗi kết nối', 
-            `Không thể kết nối đến ${targetIp}\n\nKiểm tra:\n• IP có đúng không?\n• Thiết bị có cùng WiFi không?\n• Ứng dụng đã mở ở thiết bị kia chưa?`
-          );
-        }
-      }, 5000);
-
-      client.on('error', (error: any) => {
-        clearTimeout(connectionTimeout);
-        
-        let errorMessage = 'Không thể kết nối đến ' + targetIp;
-        const errMsg = error?.message || '';
-        
-        if (errMsg.includes('ECONNREFUSED')) {
-          errorMessage += '\n\n❌ Kết nối bị từ chối!\nỨng dụng chưa được mở ở thiết bị đích.';
-        } else if (errMsg.includes('ETIMEDOUT') || errMsg.includes('timeout')) {
-          errorMessage += '\n\n⏱️ Hết thời gian chờ!\nKiểm tra kết nối mạng và IP.';
-        } else if (errMsg.includes('ENETUNREACH') || errMsg.includes('EHOSTUNREACH')) {
-          errorMessage += '\n\n🌐 Không thể truy cập mạng!\nKiểm tra cả 2 thiết bị có cùng WiFi.';
-        } else if (errMsg) {
-          errorMessage += '\n\n' + errMsg;
-        }
-        
-        Alert.alert('Lỗi kết nối', errorMessage);
-      });
-
-      client.on('close', () => {
-        clearTimeout(connectionTimeout);
-      });
-
-      clientRef.current = client;
-    } catch (error: any) {
-      Alert.alert('Lỗi', 'Không thể gửi tin nhắn: ' + error.message);
+    const encryptedKey = encryptSessionKeyWithRSA(aesKey, partnerRSAPublicKey);
+    if (encryptedKey) {
+      socketRef.current.write('SESSION::' + encryptedKey);
+      addSystemMsg('📤 Đã gửi Key AES (Được khóa bởi RSA).');
+    } else {
+      Alert.alert("Lỗi", "Không thể mã hóa Key AES!");
     }
   };
+
+  const sendMessage = (content: string, type: 'text' | 'voice' | 'image' | 'stego' = 'text', ttl?: number) => {
+    if (!socketRef.current || !securityCtx?.sessionKey) return alert('Chưa có Key bảo mật! Hãy bấm nút Gửi Key (Tím) trước.');
+    
+    const msgData = { content, type, timestamp: Date.now(), ttl };
+    
+    // Gọi hàm mã hóa mới
+    const result = encryptPacket(JSON.stringify(msgData), securityCtx.sessionKey, securityCtx.myRSAPrivateKey);
+    
+    // Kiểm tra kết quả mã hóa
+    if (result.encryptedData) {
+      socketRef.current.write(result.encryptedData);
+      setMessages(p => [...p, {
+        id: Date.now().toString(), text: content, type, sender: 'me',
+        timestamp: new Date(), isVerified: true, 
+        signature: result.signature, // Lưu chữ ký để hiển thị cho mình
+        expiresAt: ttl ? Date.now() + ttl : undefined
+      }]);
+    } else {
+      Alert.alert("Lỗi Gửi", "Mã hóa thất bại!");
+    }
+  };
+
+  const addSystemMsg = (txt: string) => {
+    setMessages(p => [...p, { id: Date.now().toString(), text: txt, sender: 'system', timestamp: new Date(), type: 'text' }]);
+  };
+
+  useEffect(() => {
+    const i = setInterval(() => setMessages(m => m.filter(msg => !msg.expiresAt || msg.expiresAt > Date.now())), 1000);
+    return () => clearInterval(i);
+  }, []);
+
+  const handleLogin = () => {
+    if (loginPass === '1234') setViewMode('CHAT');
+    else if (loginPass === '0000') setViewMode('TODO');
+    else alert('Sai mật khẩu (Hint: 1234)');
+  };
+
+  if (viewMode === 'LOGIN') {
+    return (
+      <View style={styles.centerContainer}>
+        <Text style={styles.title}>🔐 SECURE LOGIN</Text>
+        <TextInput style={styles.loginInput} placeholder="Passcode" secureTextEntry value={loginPass} onChangeText={setLoginPass} keyboardType="numeric"/>
+        <TouchableOpacity style={styles.btn} onPress={handleLogin}><Text style={{color:'white'}}>UNLOCK</Text></TouchableOpacity>
+        <Text style={{marginTop: 20, color:'#888'}}>Pass thật: 1234 | Pass giả: 0000</Text>
+      </View>
+    );
+  }
+
+  if (viewMode === 'TODO') {
+    return (
+      <View style={styles.container}>
+        <Text style={[styles.title, {color:'#333'}]}>📝 Danh sách việc cần làm</Text>
+        <Text style={styles.todo}>▢ Mua rau muống</Text>
+        <Text style={styles.todo}>▢ Học bài</Text>
+        <TouchableOpacity onPress={() => setViewMode('LOGIN')} style={{marginTop:50}}><Text>Đăng xuất</Text></TouchableOpacity>
+      </View>
+    );
+  }
 
   return (
-    <>
-      <StatusBar barStyle="light-content" backgroundColor="#0084ff" />
-      <ImageBackground
-        source={require('./assets/Logo.jpg')}
-        style={styles.backgroundImage}
-        imageStyle={styles.backgroundImageStyle}
-      >
-        <SafeAreaView style={styles.container}>
-          {/* Header */}
-          <View style={styles.header}>
-            <Text style={styles.title}>💬 ChatNET</Text>
-            <TouchableOpacity 
-              style={styles.settingsButton}
-              onPress={() => setShowSettingsModal(true)}
-              activeOpacity={0.7}
-            >
-              <Image 
-                source={require('./assets/setting.png')} 
-                style={styles.settingsIcon}
-                resizeMode="contain"
-              />
-            </TouchableOpacity>
-          </View>
-
-          <KeyboardAvoidingView
-            behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
-            style={styles.keyboardAvoid}
-            keyboardVerticalOffset={Platform.OS === 'ios' ? 0 : 0}
+    <SafeAreaView style={{flex: 1, backgroundColor: '#121212'}}>
+      <StatusBar barStyle="light-content" />
+      <View style={styles.header}>
+        <View>
+          <Text style={{color:'#fff', fontWeight:'bold'}}>IP Của Tôi: {myIp}</Text>
+          <Text style={{color: safetyNumber !== '---' ? '#00ff00' : '#888', fontSize:11, fontWeight:'bold'}}>
+             🛡️ MITM Safety: {safetyNumber}
+          </Text>
+          <Text style={{fontSize:10, color: partnerRSAPublicKey ? '#4CAF50' : '#FF5722'}}>
+             🔑 RSA Key: {partnerRSAPublicKey ? 'ĐÃ NHẬN ✅' : 'CHƯA CÓ ❌'}
+          </Text>
+        </View>
+        <TouchableOpacity onPress={() => { setMessages([]); setSecurityCtx(null); setViewMode('LOGIN'); }} style={styles.panicBtn}>
+          <Text>🆘 PANIC</Text>
+        </TouchableOpacity>
+      </View>
+      <View style={styles.connBar}>
+        {!isConnected ? (
+          <>
+            <TextInput style={styles.ipInput} placeholder="IP Đối phương" placeholderTextColor="#888" onChangeText={setTargetIp} />
+            <TouchableOpacity onPress={connectAndHandshake} style={styles.connBtn}><Text style={{color:'#fff'}}>1. KẾT NỐI</Text></TouchableOpacity>
+          </>
+        ) : (
+          <TouchableOpacity onPress={sendSecureKey} style={[styles.connBtn, {backgroundColor:'purple', flex:1}]}>
+            <Text style={{color:'#fff', fontWeight:'bold'}}>2. GỬI KEY AES (RSA ENCRYPTED) 🚀</Text>
+          </TouchableOpacity>
+        )}
+      </View>
+      <ScrollView style={{flex:1, padding:10}}>
+        <Text style={{color:'#666', fontSize:12, textAlign:'center', marginBottom:10}}>
+          (Bấm vào tin nhắn bất kỳ để soi Bằng chứng thép)
+        </Text>
+        {messages.map((m) => (
+          <TouchableOpacity 
+            key={m.id} activeOpacity={0.8} onPress={() => setSelectedMsg(m)}
+            style={[styles.msgBubble, m.sender==='me'?styles.me:m.sender==='system'?styles.sys:styles.other]}
           >
-
-            {/* Settings Modal */}
-            <Modal
-              visible={showSettingsModal}
-              transparent={true}
-              animationType="slide"
-              onRequestClose={() => setShowSettingsModal(false)}
-            >
-              <View style={styles.modalOverlay}>
-                <View style={styles.modalContent}>
-                  <View style={styles.modalHeader}>
-                    <Text style={styles.modalTitle}>⚙️ Cài đặt</Text>
-                    <TouchableOpacity 
-                      onPress={() => setShowSettingsModal(false)}
-                      style={styles.closeButton}
-                    >
-                      <Text style={styles.closeButtonText}>✕</Text>
-                    </TouchableOpacity>
-                  </View>
-
-                  <ScrollView style={styles.modalBody}>
-                    {/* My IP */}
-                    <View style={styles.modalSection}>
-                      <Text style={styles.modalLabel}>📱 Địa chỉ IP của bạn</Text>
-                      <View style={styles.ipDisplayRow}>
-                        <Text style={styles.ipDisplayText}>{myIp}</Text>
-                        <TouchableOpacity 
-                          style={styles.reloadButton} 
-                          onPress={fetchIpAddress}
-                          activeOpacity={0.7}
-                        >
-                          <Text style={styles.reloadIcon}>↻</Text>
-                        </TouchableOpacity>
-                      </View>
-                    </View>
-
-                    {/* Target IP */}
-                    <View style={styles.modalSection}>
-                      <Text style={styles.modalLabel}>🌐 IP người nhận</Text>
-                      <TextInput
-                        style={styles.modalInput}
-                        value={targetIp}
-                        onChangeText={setTargetIp}
-                        placeholder="Nhập IP (ví dụ: 192.168.1.100)"
-                        placeholderTextColor="#aaa"
-                        keyboardType="numeric"
-                      />
-                    </View>
-
-                    {/* Encryption Toggle */}
-                    <View style={styles.modalSection}>
-                      <View style={styles.toggleRow}>
-                        <View style={styles.toggleLabelContainer}>
-                          <Text style={styles.modalLabel}>🔐 Chế độ mã hóa</Text>
-                          <Text style={styles.toggleSubLabel}>
-                            {isEncryptionEnabled ? 'Đang bật' : 'Đang tắt'}
-                          </Text>
-                        </View>
-                        <TouchableOpacity
-                          style={[
-                            styles.toggleButton,
-                            isEncryptionEnabled ? styles.toggleButtonOn : styles.toggleButtonOff
-                          ]}
-                          onPress={() => setIsEncryptionEnabled(!isEncryptionEnabled)}
-                          activeOpacity={0.7}
-                        >
-                          <View style={[
-                            styles.toggleCircle,
-                            isEncryptionEnabled ? styles.toggleCircleOn : styles.toggleCircleOff
-                          ]} />
-                        </TouchableOpacity>
-                      </View>
-                    </View>
-
-                    {/* Encryption Key - Only show when encryption is enabled */}
-                    {isEncryptionEnabled && (
-                      <View style={styles.modalSection}>
-                        <Text style={styles.modalLabel}>🔑 Key mã hóa (1-25)</Text>
-                        <TextInput
-                          style={styles.modalInput}
-                          value={encryptionKey}
-                          onChangeText={setEncryptionKey}
-                          placeholder="3"
-                          placeholderTextColor="#aaa"
-                          keyboardType="number-pad"
-                          maxLength={2}
-                        />
-                        <View style={styles.infoBox}>
-                          <Text style={styles.infoIcon}>ℹ️</Text>
-                          <Text style={styles.infoText}>
-                            Cả 2 người phải dùng cùng key để chat được với nhau.
-                          </Text>
-                        </View>
-                      </View>
-                    )}
-                  </ScrollView>
-
-                  <TouchableOpacity 
-                    style={styles.saveButton}
-                    onPress={() => setShowSettingsModal(false)}
-                    activeOpacity={0.7}
-                  >
-                    <Text style={styles.saveButtonText}>✓ Lưu cài đặt</Text>
-                  </TouchableOpacity>
-                </View>
+             {m.isVerified && <Text style={{fontSize:10, color:'#00ff00'}}>✓ Signed</Text>}
+             <Text style={{color: m.sender==='system'?'#aaa':'#fff'}}>
+               {m.type==='voice' ? '🎤 [Voice Encrypted]' : m.type==='stego' ? `🖼️ [Stego Image]: ${m.text}` : m.text}
+             </Text>
+             {m.expiresAt && <Text style={{fontSize:10, color:'red'}}>💣 {Math.round((m.expiresAt-Date.now())/1000)}s</Text>}
+          </TouchableOpacity>
+        ))}
+      </ScrollView>
+      <Modal visible={!!selectedMsg} transparent={true} animationType="fade" onRequestClose={() => setSelectedMsg(null)}>
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalContent}>
+            <Text style={styles.modalTitle}>🕵️ KÍNH LÚP BẢO MẬT</Text>
+            <ScrollView>
+              <View style={styles.section}>
+                <Text style={styles.label}>Nội dung gốc:</Text>
+                <Text style={styles.value}>{selectedMsg?.text}</Text>
               </View>
-            </Modal>
-
-            {/* Messages Area */}
-            <View style={styles.chatArea}>
-              <ScrollView
-                ref={scrollViewRef}
-                style={styles.messagesContainer}
-                contentContainerStyle={styles.messagesContent}
-                onContentSizeChange={() => scrollViewRef.current?.scrollToEnd({ animated: true })}
-              >
-                {messages.length === 0 ? (
-                  <View style={styles.emptyState}>
-                    <Text style={styles.emptyText}>Vui lòng cài đặt trước khi trò chuyện</Text>
-                  </View>
-                ) : (
-                  messages.map((msg, index) => (
-                    <View
-                      key={index}
-                      style={[
-                        styles.messageRow,
-                        msg.sender === 'me' ? styles.myMessageRow : styles.otherMessageRow,
-                      ]}
-                    >
-                      <View
-                        style={[
-                          styles.messageBubble,
-                          msg.sender === 'me' ? styles.myMessage : styles.otherMessage,
-                        ]}
-                      >
-                        <Text style={[
-                          styles.messageText,
-                          msg.sender === 'me' ? styles.myMessageText : styles.otherMessageText,
-                        ]}>
-                          {msg.text}
-                        </Text>
-                        <Text style={[
-                          styles.timestamp,
-                          msg.sender === 'me' ? styles.myTimestamp : styles.otherTimestamp,
-                        ]}>
-                          {msg.timestamp.toLocaleTimeString('vi-VN', {
-                            hour: '2-digit',
-                            minute: '2-digit',
-                          })}
-                        </Text>
-                      </View>
-                    </View>
-                  ))
-                )}
-              </ScrollView>
-            </View>
-
-            {/* Message Input */}
-            <View style={styles.inputContainer}>
-              <TextInput
-                style={styles.messageInput}
-                value={message}
-                onChangeText={setMessage}
-                placeholder="Nhập tin nhắn..."
-                placeholderTextColor="#999"
-                multiline
-                maxLength={500}
-              />
-              <TouchableOpacity 
-                style={[styles.sendButton, !message.trim() && styles.sendButtonDisabled]} 
-                onPress={sendMessage}
-                activeOpacity={0.7}
-                disabled={!message.trim()}
-              >
-                <Image 
-                  source={require('./assets/send-message.png')} 
-                  style={styles.sendIcon}
-                  resizeMode="contain"
-                />
-              </TouchableOpacity>
-            </View>
-          </KeyboardAvoidingView>
-        </SafeAreaView>
-      </ImageBackground>
-    </>
+              <View style={styles.section}>
+                <Text style={styles.label}>Giá trị băm (SHA-256):</Text>
+                <Text style={styles.code}>{selectedMsg ? CryptoJS.SHA256(selectedMsg.text).toString() : ''}</Text>
+              </View>
+              <View style={styles.section}>
+                <Text style={styles.label}>Chữ ký số (RSA Signature):</Text>
+                <Text style={styles.code}>{selectedMsg?.signature || '(Không có signature)'}</Text>
+              </View>
+              <View style={{alignItems:'center', marginTop:15}}>
+                 {selectedMsg?.isVerified ? (
+                    <Text style={{color:'green', fontWeight:'bold', fontSize:18}}>✅ ĐÃ XÁC THỰC (VERIFIED)</Text>
+                 ) : (
+                    <Text style={{color:'#0084ff', fontStyle:'italic'}}>Tin nhắn tự gửi</Text>
+                 )}
+              </View>
+            </ScrollView>
+            <TouchableOpacity style={styles.closeBtn} onPress={() => setSelectedMsg(null)}><Text style={{color:'#fff'}}>Đóng</Text></TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
+      <View style={styles.inputArea}>
+        <TextInput style={styles.input} value={inputText} onChangeText={setInputText} placeholder="Tin nhắn..." placeholderTextColor="#666"/>
+        <TouchableOpacity onPress={()=>sendMessage(inputText)} style={styles.sendBtn}><Text>➤</Text></TouchableOpacity>
+        <TouchableOpacity onPress={()=>sendMessage(inputText,'text',10000)} style={[styles.sendBtn, {backgroundColor:'red'}]}><Text>💣</Text></TouchableOpacity>
+        <TouchableOpacity onPress={()=>sendMessage(inputText,'stego')} style={[styles.sendBtn, {backgroundColor:'green'}]}><Text>🖼️</Text></TouchableOpacity>
+      </View>
+    </SafeAreaView>
   );
 }
 
 const styles = StyleSheet.create({
-  backgroundImage: {
-    flex: 1,
-  },
-  backgroundImageStyle: {
-    opacity: 0.50,
-    resizeMode: 'contain',
-    alignSelf: 'center',
-  },
-  container: {
-    flex: 1,
-    backgroundColor: 'transparent',
-  },
-  keyboardAvoid: {
-    flex: 1,
-  },
-  header: {
-    backgroundColor: '#0084ff',
-    paddingHorizontal: scale(15),
-    paddingTop: Platform.OS === 'ios' ? verticalScale(20) : verticalScale(45),
-    paddingBottom: verticalScale(16),
-    elevation: 4,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.15,
-    shadowRadius: 3,
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-  },
-  title: {
-    fontSize: responsiveFontSize(24),
-    fontWeight: 'bold',
-    color: '#fff',
-    letterSpacing: 0.5,
-  },
-  settingsButton: {
-    padding: scale(8),
-    borderRadius: scale(20),
-    backgroundColor: 'rgba(255, 255, 255, 0.2)',
-  },
-  settingsIcon: {
-    width: moderateScale(26),
-    height: moderateScale(26),
-    tintColor: '#fff',
-  },
-  // Modal styles
-  modalOverlay: {
-    flex: 1,
-    backgroundColor: 'rgba(0, 0, 0, 0.5)',
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  modalContent: {
-    backgroundColor: '#fff',
-    borderRadius: moderateScale(20),
-    width: SCREEN_WIDTH * 0.9,
-    maxHeight: SCREEN_HEIGHT * 0.8,
-    elevation: 5,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.25,
-    shadowRadius: 3.84,
-  },
-  modalHeader: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    padding: moderateScale(20),
-    borderBottomWidth: 1,
-    borderBottomColor: '#e0e0e0',
-  },
-  modalTitle: {
-    fontSize: responsiveFontSize(20),
-    fontWeight: 'bold',
-    color: '#333',
-  },
-  closeButton: {
-    padding: scale(5),
-  },
-  closeButtonText: {
-    fontSize: responsiveFontSize(24),
-    color: '#666',
-    fontWeight: 'bold',
-  },
-  modalBody: {
-    padding: moderateScale(20),
-  },
-  modalSection: {
-    marginBottom: verticalScale(20),
-  },
-  modalLabel: {
-    fontSize: responsiveFontSize(14),
-    fontWeight: '600',
-    color: '#333',
-    marginBottom: verticalScale(8),
-  },
-  ipDisplayRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    backgroundColor: '#f5f5f5',
-    padding: moderateScale(12),
-    borderRadius: moderateScale(10),
-    borderWidth: 1,
-    borderColor: '#e0e0e0',
-  },
-  ipDisplayText: {
-    flex: 1,
-    fontSize: responsiveFontSize(15),
-    fontWeight: '600',
-    color: '#0084ff',
-  },
-  reloadButton: {
-    backgroundColor: '#0084ff',
-    borderRadius: moderateScale(17),
-    width: moderateScale(34),
-    height: moderateScale(34),
-    justifyContent: 'center',
-    alignItems: 'center',
-    marginLeft: scale(10),
-  },
-  reloadIcon: {
-    fontSize: responsiveFontSize(20),
-    color: '#fff',
-    fontWeight: 'bold',
-  },
-  modalInput: {
-    borderWidth: 1.5,
-    borderColor: '#d0d0d0',
-    borderRadius: moderateScale(10),
-    padding: moderateScale(14),
-    fontSize: responsiveFontSize(15),
-    color: '#333',
-    backgroundColor: '#fafafa',
-  },
-  infoBox: {
-    flexDirection: 'row',
-    backgroundColor: '#e3f2fd',
-    padding: moderateScale(12),
-    borderRadius: moderateScale(8),
-    marginTop: verticalScale(8),
-    borderLeftWidth: 3,
-    borderLeftColor: '#2196F3',
-  },
-  infoIcon: {
-    fontSize: responsiveFontSize(18),
-    marginRight: scale(8),
-  },
-  infoText: {
-    flex: 1,
-    fontSize: responsiveFontSize(12),
-    color: '#1565C0',
-    lineHeight: responsiveFontSize(18),
-  },
-  saveButton: {
-    backgroundColor: '#4CAF50',
-    padding: moderateScale(16),
-    margin: moderateScale(20),
-    marginTop: 0,
-    borderRadius: moderateScale(12),
-    alignItems: 'center',
-  },
-  saveButtonText: {
-    color: '#fff',
-    fontSize: responsiveFontSize(16),
-    fontWeight: 'bold',
-  },
-  toggleRow: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-  },
-  toggleLabelContainer: {
-    flex: 1,
-  },
-  toggleSubLabel: {
-    fontSize: responsiveFontSize(12),
-    color: '#666',
-    marginTop: verticalScale(2),
-  },
-  toggleButton: {
-    width: moderateScale(56),
-    height: moderateScale(32),
-    borderRadius: moderateScale(16),
-    padding: scale(2),
-    justifyContent: 'center',
-  },
-  toggleButtonOn: {
-    backgroundColor: '#4CAF50',
-    alignItems: 'flex-end',
-  },
-  toggleButtonOff: {
-    backgroundColor: '#ccc',
-    alignItems: 'flex-start',
-  },
-  toggleCircle: {
-    width: moderateScale(28),
-    height: moderateScale(28),
-    borderRadius: moderateScale(14),
-    backgroundColor: '#fff',
-    elevation: 2,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 1 },
-    shadowOpacity: 0.2,
-    shadowRadius: 1.5,
-  },
-  toggleCircleOn: {
-  },
-  toggleCircleOff: {
-  },
-  chatArea: {
-    flex: 1,
-    backgroundColor: 'rgba(240, 242, 245, 0.85)',
-    marginBottom: 0,
-  },
-  messagesContainer: {
-    flex: 1,
-  },
-  messagesContent: {
-    padding: moderateScale(14),
-    flexGrow: 1,
-  },
-  emptyState: {
-    flex: 1,
-    justifyContent: 'center',
-    alignItems: 'center',
-    paddingVertical: verticalScale(50),
-    paddingHorizontal: scale(20),
-  },
-  emptyText: {
-    fontSize: responsiveFontSize(15),
-    color: '#888',
-    textAlign: 'center',
-    lineHeight: responsiveFontSize(20),
-  },
-  messageRow: {
-    marginVertical: verticalScale(4),
-  },
-  myMessageRow: {
-    alignItems: 'flex-end',
-  },
-  otherMessageRow: {
-    alignItems: 'flex-start',
-  },
-  messageBubble: {
-    maxWidth: SCREEN_WIDTH * 0.75,
-    padding: moderateScale(12),
-    borderRadius: moderateScale(16),
-    elevation: 1,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 1 },
-    shadowOpacity: 0.1,
-    shadowRadius: 1.5,
-  },
-  myMessage: {
-    backgroundColor: '#0084ff',
-    borderBottomRightRadius: moderateScale(4),
-  },
-  otherMessage: {
-    backgroundColor: '#fff',
-    borderBottomLeftRadius: moderateScale(4),
-  },
-  messageText: {
-    fontSize: responsiveFontSize(15),
-    marginBottom: verticalScale(3),
-    lineHeight: responsiveFontSize(20),
-  },
-  myMessageText: {
-    color: '#fff',
-  },
-  otherMessageText: {
-    color: '#000',
-  },
-  timestamp: {
-    fontSize: responsiveFontSize(11),
-    alignSelf: 'flex-end',
-    marginTop: verticalScale(2),
-  },
-  myTimestamp: {
-    color: 'rgba(255, 255, 255, 0.8)',
-  },
-  otherTimestamp: {
-    color: '#666',
-  },
-  inputContainer: {
-    flexDirection: 'row',
-    padding: moderateScale(14),
-    paddingBottom: verticalScale(24),
-    backgroundColor: 'rgba(255, 255, 255, 0.95)',
-    borderTopWidth: 0,
-    alignItems: 'center',
-    elevation: 10,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: -3 },
-    shadowOpacity: 0.15,
-    shadowRadius: 5,
-  },
-  messageInput: {
-    flex: 1,
-    borderWidth: 1.5,
-    borderColor: '#d0d0d0',
-    borderRadius: moderateScale(25),
-    paddingHorizontal: scale(16),
-    paddingVertical: verticalScale(10),
-    fontSize: responsiveFontSize(15),
-    maxHeight: verticalScale(100),
-    color: '#333',
-    marginRight: scale(10),
-    backgroundColor: '#fafafa',
-  },
-  sendButton: {
-    backgroundColor: 'transparent',
-    width: moderateScale(25),
-    height: moderateScale(25),
-    borderRadius: moderateScale(13),
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  sendButtonDisabled: {
-    opacity: 0.4,
-  },
-  sendIcon: {
-    width: moderateScale(25),
-    height: moderateScale(25),
-  },
+  centerContainer: { flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: '#f0f0f0' },
+  container: { flex: 1, padding: 20, backgroundColor: '#fff' },
+  title: { fontSize: 24, fontWeight: 'bold', marginBottom: 20, color: '#000' },
+  loginInput: { width: 200, height: 50, borderWidth: 1, textAlign: 'center', fontSize: 20, borderRadius: 10, backgroundColor: '#fff', color: '#000', marginBottom: 10 },
+  btn: { backgroundColor: '#333', padding: 15, borderRadius: 10, width: 200, alignItems: 'center' },
+  todo: { fontSize: 18, marginVertical: 10, borderBottomWidth: 1, paddingBottom: 5, color: '#333' },
+  header: { flexDirection: 'row', justifyContent: 'space-between', padding: 15, backgroundColor: '#1e1e1e', alignItems: 'center', borderBottomWidth:1, borderColor:'#333' },
+  panicBtn: { backgroundColor: 'red', padding: 10, borderRadius: 5 },
+  connBar: { flexDirection: 'row', padding: 10, backgroundColor: '#252525' },
+  ipInput: { flex: 1, backgroundColor: '#fff', borderRadius: 5, padding: 8, marginRight: 10, color: '#000' },
+  connBtn: { backgroundColor: '#0084ff', justifyContent: 'center', padding: 10, borderRadius: 5, alignItems: 'center' },
+  msgBubble: { padding: 12, borderRadius: 10, marginVertical: 5, maxWidth: '85%' },
+  me: { alignSelf: 'flex-end', backgroundColor: '#0084ff' },
+  other: { alignSelf: 'flex-start', backgroundColor: '#333' },
+  sys: { alignSelf: 'center', backgroundColor: 'transparent', padding: 5 },
+  inputArea: { flexDirection: 'row', padding: 10, backgroundColor: '#1e1e1e' },
+  input: { flex: 1, backgroundColor: '#333', color: '#fff', borderRadius: 20, paddingHorizontal: 15, marginRight: 5 },
+  sendBtn: { width: 40, height: 40, justifyContent: 'center', alignItems: 'center', borderRadius: 20, backgroundColor: '#0084ff', marginLeft: 5 },
+  modalOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.8)', justifyContent: 'center', alignItems: 'center' },
+  modalContent: { width: '90%', maxHeight: '70%', backgroundColor: '#fff', borderRadius: 15, padding: 20 },
+  modalTitle: { fontSize: 20, fontWeight: 'bold', color: '#0084ff', textAlign: 'center', marginBottom: 15 },
+  section: { marginBottom: 15 },
+  label: { fontWeight: 'bold', color: '#333', marginBottom: 5 },
+  value: { fontSize: 16, color: '#000' },
+  code: { fontFamily: 'monospace', fontSize: 11, backgroundColor: '#f0f0f0', padding: 8, borderRadius: 5, color: '#555' },
+  closeBtn: { backgroundColor: '#0084ff', padding: 12, borderRadius: 10, alignItems: 'center', marginTop: 15 },
 });
 
 export default App;
