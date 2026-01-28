@@ -1,6 +1,6 @@
 
 # ChatNET - Secure Communication Protocol
-> Ứng dụng nhắn tin bảo mật sử dụng mô hình Mã hóa lai (Hybrid Cryptosystem), Chữ ký số và Xác thực toàn vẹn dữ liệu.
+> Ứng dụng nhắn tin bảo mật sử dụng mô hình RSA, AES, hàm băm, Chữ ký số và Xác thực toàn vẹn dữ liệu.
 
 ## 🌟 Tổng quan kỹ thuật (Technical Overview)
 
